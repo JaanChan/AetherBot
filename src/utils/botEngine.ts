@@ -1,0 +1,760 @@
+import {
+  BotDatabaseState,
+  MemberProfile,
+  PermissionKey,
+  RoleConfig,
+  ShopItem,
+  WelcomeConfig,
+  WelcomeJoinPreview,
+} from '../types/bot';
+
+/**
+ * Standard Nextcord / Mee6-style quadratic XP formula:
+ * XP required to advance from `level` to `level + 1`:
+ * 5 * (level ^ 2) + 50 * level + 100
+ */
+export function getXpRequiredForNextLevel(level: number): number {
+  const safeLevel = Math.max(0, Math.floor(level));
+  return 5 * safeLevel * safeLevel + 50 * safeLevel + 100;
+}
+
+/**
+ * Total cumulative XP required to reach `targetLevel` from level 0.
+ */
+export function getCumulativeXpForLevel(targetLevel: number): number {
+  let total = 0;
+  for (let l = 0; l < targetLevel; l++) {
+    total += getXpRequiredForNextLevel(l);
+  }
+  return total;
+}
+
+/**
+ * Given total cumulative XP, returns current level, current level progress XP, and required XP for next level.
+ */
+export function calculateLevelProgress(totalXp: number): {
+  level: number;
+  currentLevelXp: number;
+  nextLevelXp: number;
+  progressPercent: number;
+} {
+  let remaining = Math.max(0, Math.floor(totalXp));
+  let level = 0;
+  while (true) {
+    const needed = getXpRequiredForNextLevel(level);
+    if (remaining >= needed) {
+      remaining -= needed;
+      level += 1;
+    } else {
+      const progressPercent = Math.min(100, Math.round((remaining / needed) * 100));
+      return {
+        level,
+        currentLevelXp: remaining,
+        nextLevelXp: needed,
+        progressPercent,
+      };
+    }
+  }
+}
+
+/**
+ * Checks whether a member's assigned role grants a specific permission key.
+ */
+export function hasRolePermission(
+  member: MemberProfile,
+  roles: RoleConfig[],
+  permission: PermissionKey
+): boolean {
+  const role = roles.find((r) => r.id === member.roleId);
+  if (!role) return false;
+  return role.permissions.includes(permission);
+}
+
+/**
+ * Calculates the payout multiplier for the Aether Mines 5x5 grid mini-game.
+ * Uses house-edge adjusted combinatorial probability.
+ */
+export function calculateMinesMultiplier(totalGemsRevealed: number, bombCount: number): number {
+  const totalCells = 25;
+  const safeBombs = Math.min(20, Math.max(1, Math.floor(bombCount)));
+  const revealed = Math.max(0, Math.floor(totalGemsRevealed));
+  if (revealed === 0) return 1.0;
+
+  let probability = 1.0;
+  for (let i = 0; i < revealed; i++) {
+    probability *= (totalCells - safeBombs - i) / (totalCells - i);
+  }
+  if (probability <= 0) return 1.0;
+  const rawMultiplier = (0.96 / probability);
+  return Math.round(rawMultiplier * 100) / 100;
+}
+
+/**
+ * Evaluates a Blackjack hand total, treating Aces as 11 or 1 optimally.
+ */
+export function evaluateBlackjackHand(cards: { rank: string; suit: string; value: number }[]): {
+  total: number;
+  isSoft: boolean;
+  isBust: boolean;
+  isBlackjack: boolean;
+} {
+  let total = 0;
+  let aces = 0;
+  for (const card of cards) {
+    if (card.rank === 'A') {
+      aces += 1;
+      total += 11;
+    } else {
+      total += card.value;
+    }
+  }
+  while (total > 21 && aces > 0) {
+    total -= 10;
+    aces -= 1;
+  }
+  return {
+    total,
+    isSoft: aces > 0,
+    isBust: total > 21,
+    isBlackjack: cards.length === 2 && total === 21,
+  };
+}
+
+/**
+ * Interpolates Nextcord welcome message template variables:
+ * {user}, {server}, {member_count}, {inviter}, {role}
+ */
+export function formatWelcomeTemplate(
+  template: string,
+  context: {
+    user: string;
+    server: string;
+    memberCount: number;
+    inviter: string;
+    role: string;
+  }
+): string {
+  return template
+    .replace(/\{user\}/g, context.user)
+    .replace(/\{server\}/g, context.server)
+    .replace(/\{member_count\}/g, String(context.memberCount))
+    .replace(/\{inviter\}/g, context.inviter)
+    .replace(/\{role\}/g, context.role);
+}
+
+/**
+ * Processes an economy transfer between Wallet and Bank Vault (deposit or withdraw).
+ */
+export function processBankTransfer(
+  member: MemberProfile,
+  direction: 'deposit' | 'withdraw',
+  amount: number
+): { ok: boolean; error?: string; updatedMember?: MemberProfile } {
+  const cleanAmount = Math.floor(amount);
+  if (!Number.isFinite(cleanAmount) || cleanAmount <= 0) {
+    return { ok: false, error: 'Transfer amount must be a positive integer.' };
+  }
+
+  if (direction === 'deposit') {
+    if (cleanAmount > member.wallet) {
+      return { ok: false, error: 'Insufficient wallet balance for this deposit.' };
+    }
+    const availableSpace = Math.max(0, member.bankCapacity - member.bank);
+    if (cleanAmount > availableSpace) {
+      return {
+        ok: false,
+        error: `Vault capacity exceeded. Available vault space: ${availableSpace.toLocaleString()} Shards.`,
+      };
+    }
+    return {
+      ok: true,
+      updatedMember: {
+        ...member,
+        wallet: member.wallet - cleanAmount,
+        bank: member.bank + cleanAmount,
+      },
+    };
+  } else {
+    if (cleanAmount > member.bank) {
+      return { ok: false, error: 'Insufficient bank vault balance for withdrawal.' };
+    }
+    return {
+      ok: true,
+      updatedMember: {
+        ...member,
+        wallet: member.wallet + cleanAmount,
+        bank: member.bank - cleanAmount,
+      },
+    };
+  }
+}
+
+/**
+ * Processes purchasing a ShopItem for a member.
+ */
+export function processShopPurchase(
+  member: MemberProfile,
+  item: ShopItem
+): { ok: boolean; error?: string; updatedMember?: MemberProfile } {
+  if (member.level < item.requiredLevel) {
+    return {
+      ok: false,
+      error: `Requires Level ${item.requiredLevel} (you are currently Level ${member.level}).`,
+    };
+  }
+  if (member.wallet < item.price) {
+    return {
+      ok: false,
+      error: `Insufficient wallet Shards. Need ${item.price.toLocaleString()} ◈ (have ${member.wallet.toLocaleString()} ◈).`,
+    };
+  }
+  if (member.inventory.includes(item.name) && (item.category === 'role' || item.category === 'cosmetic')) {
+    return {
+      ok: false,
+      error: `You already own the permanent item "${item.name}".`,
+    };
+  }
+
+  let bonusCapacity = 0;
+  let bonusXp = 0;
+  if (item.id === 'item-vault-expansion') {
+    bonusCapacity = 25000;
+  } else if (item.id === 'item-xp-overdrive') {
+    bonusXp = 750;
+  }
+
+  const newTotalXp = member.xp + bonusXp;
+  const { level } = calculateLevelProgress(newTotalXp);
+
+  return {
+    ok: true,
+    updatedMember: {
+      ...member,
+      wallet: member.wallet - item.price,
+      bankCapacity: member.bankCapacity + bonusCapacity,
+      xp: newTotalXp,
+      level,
+      roleId: item.roleRewardId ? item.roleRewardId : member.roleId,
+      inventory: [...member.inventory, item.name],
+    },
+  };
+}
+
+/**
+ * Simulates a new member joining the server and generates the rendered Welcome preview.
+ */
+export function buildWelcomePreview(
+  config: WelcomeConfig,
+  guildName: string,
+  username: string,
+  memberCount: number,
+  inviter: string,
+  autoRoleName: string
+): WelcomeJoinPreview {
+  const ctx = {
+    user: `@${username}`,
+    server: guildName,
+    memberCount,
+    inviter: `@${inviter}`,
+    role: autoRoleName,
+  };
+  return {
+    id: `join-${Date.now()}-${Math.random().toString(36).slice(2, 6)}`,
+    username,
+    memberNumber: memberCount,
+    inviter,
+    renderedMessage: formatWelcomeTemplate(config.messageTemplate, ctx),
+    renderedTitle: formatWelcomeTemplate(config.embedTitle, ctx),
+    renderedDescription: formatWelcomeTemplate(config.embedDescription, ctx),
+    timestamp: new Date().toISOString(),
+  };
+}
+
+export function createInitialBotState(): BotDatabaseState {
+  const roles: RoleConfig[] = [
+    {
+      id: 'role-architect',
+      name: 'Sovereign Admin',
+      color: '#6366F1',
+      hierarchy: 100,
+      permissions: [
+        'use_slash_commands',
+        'run_economy',
+        'run_games',
+        'mod_warn',
+        'mod_timeout',
+        'mod_kick',
+        'mod_ban',
+        'mod_purge',
+        'manage_economy',
+        'manage_welcome',
+        'view_analytics',
+      ],
+      xpMultiplier: 2.0,
+      dailyBonus: 1200,
+    },
+    {
+      id: 'role-warden',
+      name: 'Sentinel Moderator',
+      color: '#10B981',
+      hierarchy: 75,
+      permissions: [
+        'use_slash_commands',
+        'run_economy',
+        'run_games',
+        'mod_warn',
+        'mod_timeout',
+        'mod_kick',
+        'mod_purge',
+        'view_analytics',
+      ],
+      xpMultiplier: 1.5,
+      dailyBonus: 650,
+    },
+    {
+      id: 'role-vanguard',
+      name: 'Vanguard VIP',
+      color: '#F59E0B',
+      hierarchy: 50,
+      permissions: ['use_slash_commands', 'run_economy', 'run_games', 'view_analytics'],
+      xpMultiplier: 1.35,
+      dailyBonus: 500,
+    },
+    {
+      id: 'role-citizen',
+      name: 'Verified Member',
+      color: '#38BDF8',
+      hierarchy: 20,
+      permissions: ['use_slash_commands', 'run_economy', 'run_games'],
+      xpMultiplier: 1.0,
+      dailyBonus: 250,
+    },
+    {
+      id: 'role-restricted',
+      name: 'Probation / Restricted',
+      color: '#94A3B8',
+      hierarchy: 5,
+      permissions: ['use_slash_commands'],
+      xpMultiplier: 0.5,
+      dailyBonus: 0,
+    },
+  ];
+
+  const members: MemberProfile[] = [
+    {
+      id: 'mem-1',
+      username: 'kaelen_vex',
+      displayName: 'Kaelen Vex',
+      tag: 'kaelen_vex#0001',
+      roleId: 'role-architect',
+      wallet: 14850,
+      bank: 62000,
+      bankCapacity: 100000,
+      xp: 28450,
+      level: calculateLevelProgress(28450).level,
+      messagesSent: 4210,
+      commandsRun: 382,
+      gamesWon: 94,
+      gamesPlayed: 142,
+      dailyStreak: 19,
+      lastDailyClaim: '2026-11-10T18:30:00Z',
+      inventory: ['Sovereign Crest', 'Neural Overclock 2x', 'Heist Stealth Cloak'],
+      warningsCount: 0,
+      status: 'online',
+      joinedAt: '2025-08-14',
+      avatarBg: '#4F46E5',
+    },
+    {
+      id: 'mem-2',
+      username: 'lyra_solis',
+      displayName: 'Lyra Solis',
+      tag: 'lyra_solis#4821',
+      roleId: 'role-warden',
+      wallet: 8920,
+      bank: 41500,
+      bankCapacity: 75000,
+      xp: 19620,
+      level: calculateLevelProgress(19620).level,
+      messagesSent: 3190,
+      commandsRun: 295,
+      gamesWon: 78,
+      gamesPlayed: 118,
+      dailyStreak: 12,
+      lastDailyClaim: '2026-11-10T20:15:00Z',
+      inventory: ['Sentinel Badge', 'Vault Expansion Matrix'],
+      warningsCount: 0,
+      status: 'online',
+      joinedAt: '2025-09-02',
+      avatarBg: '#059669',
+    },
+    {
+      id: 'mem-3',
+      username: 'soren_kestrel',
+      displayName: 'Soren Kestrel',
+      tag: 'soren_kestrel#9012',
+      roleId: 'role-vanguard',
+      wallet: 21400,
+      bank: 34000,
+      bankCapacity: 50000,
+      xp: 14280,
+      level: calculateLevelProgress(14280).level,
+      messagesSent: 2480,
+      commandsRun: 410,
+      gamesWon: 112,
+      gamesPlayed: 189,
+      dailyStreak: 8,
+      lastDailyClaim: '2026-11-10T11:00:00Z',
+      inventory: ['Lucky Quantum Die', 'Heist Stealth Cloak'],
+      warningsCount: 1,
+      status: 'idle',
+      joinedAt: '2025-11-19',
+      avatarBg: '#D97706',
+    },
+    {
+      id: 'mem-4',
+      username: 'mira_vance',
+      displayName: 'Mira Vance',
+      tag: 'mira_vance#3319',
+      roleId: 'role-citizen',
+      wallet: 4350,
+      bank: 12800,
+      bankCapacity: 25000,
+      xp: 6840,
+      level: calculateLevelProgress(6840).level,
+      messagesSent: 1120,
+      commandsRun: 144,
+      gamesWon: 39,
+      gamesPlayed: 71,
+      dailyStreak: 5,
+      lastDailyClaim: null,
+      inventory: ['Starter Pickaxe'],
+      warningsCount: 0,
+      status: 'online',
+      joinedAt: '2026-02-10',
+      avatarBg: '#0284C7',
+    },
+    {
+      id: 'mem-5',
+      username: 'dax_hollow',
+      displayName: 'Dax Hollow',
+      tag: 'dax_hollow#7740',
+      roleId: 'role-citizen',
+      wallet: 1920,
+      bank: 5400,
+      bankCapacity: 25000,
+      xp: 3150,
+      level: calculateLevelProgress(3150).level,
+      messagesSent: 640,
+      commandsRun: 88,
+      gamesWon: 18,
+      gamesPlayed: 45,
+      dailyStreak: 2,
+      lastDailyClaim: null,
+      inventory: [],
+      warningsCount: 2,
+      status: 'dnd',
+      joinedAt: '2026-05-22',
+      avatarBg: '#7C3AED',
+    },
+    {
+      id: 'mem-6',
+      username: 'zara_nyx',
+      displayName: 'Zara Nyx',
+      tag: 'zara_nyx#1108',
+      roleId: 'role-restricted',
+      wallet: 450,
+      bank: 1000,
+      bankCapacity: 15000,
+      xp: 920,
+      level: calculateLevelProgress(920).level,
+      messagesSent: 195,
+      commandsRun: 31,
+      gamesWon: 4,
+      gamesPlayed: 16,
+      dailyStreak: 0,
+      lastDailyClaim: null,
+      inventory: [],
+      warningsCount: 3,
+      status: 'idle',
+      joinedAt: '2026-09-14',
+      avatarBg: '#64748B',
+    },
+  ];
+
+  const shopItems: ShopItem[] = [
+    {
+      id: 'item-xp-overdrive',
+      name: 'Neural Overclock +750 XP',
+      description: 'Instantly injects +750 XP into your server rank profile and recalculates level milestones.',
+      price: 1800,
+      category: 'boost',
+      effectLabel: '+750 Instant XP',
+      requiredLevel: 1,
+    },
+    {
+      id: 'item-vault-expansion',
+      name: 'Vault Expansion Matrix',
+      description: 'Permanently expands your protected Bank Vault storage limit by +25,000 Aether Shards.',
+      price: 3200,
+      category: 'utility',
+      effectLabel: '+25,000 Vault Cap',
+      requiredLevel: 3,
+    },
+    {
+      id: 'item-heist-cloak',
+      name: 'Heist Stealth Cloak',
+      description: 'Increases cooperative /heist success probability by +15% and halves fine penalties on failure.',
+      price: 4500,
+      category: 'utility',
+      effectLabel: '+15% Heist Odds',
+      requiredLevel: 5,
+    },
+    {
+      id: 'item-vanguard-pass',
+      name: 'Vanguard VIP Role Pass',
+      description: 'Unlocks the prestigious Vanguard VIP server role with 1.35x XP gain and +500 daily bonus Shards.',
+      price: 9500,
+      category: 'role',
+      effectLabel: 'Grants Vanguard VIP Role',
+      requiredLevel: 8,
+      roleRewardId: 'role-vanguard',
+    },
+    {
+      id: 'item-sovereign-banner',
+      name: 'Obsidian Horizon Rank Card',
+      description: 'Equips a custom geometric shader backdrop on your /rank profile card across leaderboards.',
+      price: 5400,
+      category: 'cosmetic',
+      effectLabel: 'Custom /rank Theme',
+      requiredLevel: 6,
+    },
+  ];
+
+  const welcome: WelcomeConfig = {
+    enabled: true,
+    channelName: '#welcome-gate',
+    dmEnabled: true,
+    autoRoleId: 'role-citizen',
+    messageTemplate: 'Welcome {user} to {server}! You are member #{member_count} (invited by {inviter}).',
+    embedTitle: 'New Explorer Arrived in {server}',
+    embedDescription:
+      'Greetings {user}! Your account has been automatically assigned the {role} role. Run /daily and /rank in #bot-commands to start earning Aether Shards.',
+    embedColor: '#6366F1',
+    showMemberCount: true,
+    showAvatarCard: true,
+    bannerTheme: 'cobalt',
+    recentJoins: [
+      {
+        id: 'join-seed-1',
+        username: 'aria_vance',
+        memberNumber: 1428,
+        inviter: 'kaelen_vex',
+        renderedMessage:
+          'Welcome @aria_vance to Aetherium Nexus! You are member #1428 (invited by @kaelen_vex).',
+        renderedTitle: 'New Explorer Arrived in Aetherium Nexus',
+        renderedDescription:
+          'Greetings @aria_vance! Your account has been automatically assigned the Verified Member role. Run /daily and /rank in #bot-commands to start earning Aether Shards.',
+        timestamp: '2026-11-11T09:42:00Z',
+      },
+    ],
+  };
+
+  return {
+    guildName: 'Aetherium Nexus',
+    guildId: '984120491823049182',
+    botPrefix: '/',
+    activeMemberId: 'mem-1',
+    roles,
+    members,
+    shopItems,
+    transactions: [
+      {
+        id: 'tx-101',
+        memberId: 'mem-1',
+        memberName: 'Kaelen Vex',
+        type: 'daily',
+        amount: 1450,
+        description: 'Claimed 19-day streak /daily reward (+1,200 Sovereign bonus)',
+        timestamp: '2026-11-11T09:15:00Z',
+      },
+      {
+        id: 'tx-102',
+        memberId: 'mem-3',
+        memberName: 'Soren Kestrel',
+        type: 'game_win',
+        amount: 3420,
+        description: 'Cashed out 3.42x multiplier in /mines (5 gems revealed)',
+        timestamp: '2026-11-11T09:30:00Z',
+      },
+      {
+        id: 'tx-103',
+        memberId: 'mem-2',
+        memberName: 'Lyra Solis',
+        type: 'shop_buy',
+        amount: -3200,
+        description: 'Purchased Vault Expansion Matrix from /shop',
+        timestamp: '2026-11-11T09:50:00Z',
+      },
+      {
+        id: 'tx-104',
+        memberId: 'mem-4',
+        memberName: 'Mira Vance',
+        type: 'work',
+        amount: 680,
+        description: 'Completed Deep-Core Telemetry Shift via /work',
+        timestamp: '2026-11-11T10:02:00Z',
+      },
+    ],
+    leveling: {
+      xpPerMessageMin: 15,
+      xpPerMessageMax: 25,
+      xpCooldownSeconds: 60,
+      voiceXpPerMinute: 10,
+      levelUpChannel: '#level-milestones',
+      announcementTemplate: 'GG {user}! You reached Level {level} and unlocked {reward}!',
+      rewards: [
+        { level: 5, roleId: 'role-citizen', roleName: 'Verified Member', shardBonus: 1000 },
+        { level: 10, roleId: 'role-vanguard', roleName: 'Vanguard VIP', shardBonus: 3500 },
+        { level: 20, roleId: 'role-warden', roleName: 'Sentinel Moderator (Trial)', shardBonus: 8000 },
+        { level: 30, roleId: 'role-architect', roleName: 'Sovereign Council', shardBonus: 20000 },
+      ],
+    },
+    modCases: [
+      {
+        id: 'case-1',
+        caseNumber: 101,
+        targetId: 'mem-6',
+        targetName: 'Zara Nyx',
+        moderatorId: 'mem-2',
+        moderatorName: 'Lyra Solis',
+        action: 'timeout',
+        reason: 'Repeatedly flooding #bot-commands with rapid macro spam.',
+        duration: '60m',
+        status: 'active',
+        timestamp: '2026-11-11T08:12:00Z',
+      },
+      {
+        id: 'case-2',
+        caseNumber: 102,
+        targetId: 'mem-5',
+        targetName: 'Dax Hollow',
+        moderatorId: 'mem-1',
+        moderatorName: 'Kaelen Vex',
+        action: 'warn',
+        reason: 'Posting unauthorized external referral invite links in #general.',
+        status: 'active',
+        timestamp: '2026-11-11T09:04:00Z',
+      },
+      {
+        id: 'case-3',
+        caseNumber: 103,
+        targetId: 'mem-3',
+        targetName: 'Soren Kestrel',
+        moderatorId: 'mem-2',
+        moderatorName: 'Lyra Solis',
+        action: 'warn',
+        reason: 'Excessive @here tagging during heist recruitment.',
+        status: 'resolved',
+        timestamp: '2026-11-10T21:40:00Z',
+      },
+    ],
+    autoModRules: [
+      {
+        id: 'am-spam',
+        name: 'Burst Message Velocity Guard',
+        description: 'Automatically mutes members sending excessive messages within a 5-second rolling window.',
+        category: 'anti_spam',
+        enabled: true,
+        thresholdLabel: 'Max Messages / 5s',
+        thresholdValue: 6,
+        action: 'timeout',
+        exemptRoleIds: ['role-architect', 'role-warden'],
+        triggeredCount: 42,
+      },
+      {
+        id: 'am-links',
+        name: 'Phishing & External Invite Filter',
+        description: 'Intercepts unverified Discord invite links and known credential phishing domains.',
+        category: 'link_guard',
+        enabled: true,
+        thresholdLabel: 'Strictness Level (1-5)',
+        thresholdValue: 4,
+        action: 'warn',
+        exemptRoleIds: ['role-architect', 'role-warden', 'role-vanguard'],
+        triggeredCount: 19,
+      },
+      {
+        id: 'am-raid',
+        name: 'Join-Spike Raid Lockdown',
+        description: 'Activates verification gates when new member joins exceed threshold within 30 seconds.',
+        category: 'raid_shield',
+        enabled: true,
+        thresholdLabel: 'Max Joins / 30s',
+        thresholdValue: 12,
+        action: 'kick',
+        exemptRoleIds: ['role-architect'],
+        triggeredCount: 3,
+      },
+      {
+        id: 'am-mentions',
+        name: 'Mass Mention Escalation',
+        description: 'Blocks messages containing excessive user or role mentions in a single payload.',
+        category: 'mention_limit',
+        enabled: true,
+        thresholdLabel: 'Max Mentions / Msg',
+        thresholdValue: 5,
+        action: 'timeout',
+        exemptRoleIds: ['role-architect', 'role-warden'],
+        triggeredCount: 11,
+      },
+    ],
+    welcome,
+    analyticsSeries: [
+      { date: 'Nov 05', messages: 3420, commandsRun: 610, newMembers: 24, shardsMinted: 48200, shardsSpent: 31500, activeUsers: 312 },
+      { date: 'Nov 06', messages: 3890, commandsRun: 740, newMembers: 31, shardsMinted: 54900, shardsSpent: 42100, activeUsers: 348 },
+      { date: 'Nov 07', messages: 4610, commandsRun: 920, newMembers: 45, shardsMinted: 69400, shardsSpent: 58000, activeUsers: 405 },
+      { date: 'Nov 08', messages: 5120, commandsRun: 1085, newMembers: 52, shardsMinted: 78200, shardsSpent: 64300, activeUsers: 439 },
+      { date: 'Nov 09', messages: 4480, commandsRun: 890, newMembers: 29, shardsMinted: 61000, shardsSpent: 49800, activeUsers: 382 },
+      { date: 'Nov 10', messages: 5390, commandsRun: 1190, newMembers: 61, shardsMinted: 84500, shardsSpent: 71200, activeUsers: 476 },
+      { date: 'Nov 11', messages: 5840, commandsRun: 1340, newMembers: 68, shardsMinted: 92400, shardsSpent: 79600, activeUsers: 518 },
+    ],
+    commandMetrics: [
+      { command: '/daily', cog: 'Economy', invocations: 2840, avgLatencyMs: 38, successRate: 99.8 },
+      { command: '/mines', cog: 'MiniGames', invocations: 2190, avgLatencyMs: 44, successRate: 99.6 },
+      { command: '/blackjack', cog: 'MiniGames', invocations: 1845, avgLatencyMs: 51, successRate: 99.4 },
+      { command: '/rank', cog: 'Leveling', invocations: 1620, avgLatencyMs: 62, successRate: 99.9 },
+      { command: '/work', cog: 'Economy', invocations: 1490, avgLatencyMs: 35, successRate: 99.7 },
+      { command: '/heist', cog: 'MiniGames', invocations: 980, avgLatencyMs: 58, successRate: 98.9 },
+      { command: '/leaderboard', cog: 'Leveling', invocations: 840, avgLatencyMs: 49, successRate: 100.0 },
+      { command: '/warn', cog: 'Moderation', invocations: 310, avgLatencyMs: 41, successRate: 100.0 },
+    ],
+    sandboxMessages: [
+      {
+        id: 'msg-welcome-init',
+        authorId: 'bot',
+        authorName: 'AetherBot [NEXTCORD v2.6]',
+        authorRoleName: 'System Bot',
+        authorRoleColor: '#6366F1',
+        isBot: true,
+        commandUsed: '/status',
+        embed: {
+          title: 'AetherBot Nextcord Engine Ready',
+          description:
+            'Persistent SQLite/JSON state synchronized. Select any slash command below or launch an interactive Nextcord ui.View mini-game (Aether Mines, Blackjack, Cyber Heist, or Dev Trivia).',
+          color: '#6366F1',
+          fields: [
+            { name: 'Active Guild', value: 'Aetherium Nexus (6 seeded members)', inline: true },
+            { name: 'Economy Circulation', value: '198,870 ◈ Aether Shards', inline: true },
+            { name: 'Loaded Cogs', value: 'Economy · Games · Leveling · Moderation · Welcome · Analytics', inline: false },
+          ],
+          footer: 'nextcord.ext.commands.Bot · Slash Application Commands Synced',
+        },
+        timestamp: '2026-11-11T10:00:00Z',
+      },
+    ],
+  };
+}
+
+export function cleanDiscordText(raw: string): string {
+  return raw.replace(/\*\*/g, '').replace(/`/g, '');
+}

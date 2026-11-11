@@ -1,0 +1,6 @@
+{
+  "name": "AetherBot — Nextcord Bot Suite & Command Studio",
+  "description": "Full-fledged Nextcord Discord bot suite featuring an interactive slash command sandbox, playable mini-games, persistent economy, XP leveling leaderboards, moderation audit suite, welcome card studio, role-based permissions, server analytics, and exportable Python Nextcord source code.",
+  "requestFramePermissions": [],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}
